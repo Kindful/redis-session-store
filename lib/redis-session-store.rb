@@ -4,7 +4,7 @@ require 'thread'
 # Redis session storage for Rails, and for Rails only. Derived from
 # the MemCacheStore code, simply dropping in Redis instead.
 class RedisSessionStore < ActionDispatch::Session::AbstractStore
-  VERSION = '0.11.0'.freeze
+  VERSION = '0.11.3'.freeze
   # Rails 3.1 and beyond defines the constant elsewhere
   unless defined?(ENV_SESSION_OPTIONS_KEY)
     if Rack.release.split('.').first.to_i > 1
@@ -94,6 +94,16 @@ class RedisSessionStore < ActionDispatch::Session::AbstractStore
     on_redis_down.call(e, env, value) if on_redis_down
 
     true
+  end
+
+  def key_exists?(value)
+    if redis.respond_to?(:exists?)
+      # added in redis gem v4.2
+      redis.exists?(prefixed(value))
+    else
+      # older method, will return an integer starting in redis gem v4.3
+      redis.exists(prefixed(value))
+    end
   end
 
   def verify_handlers!
