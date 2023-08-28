@@ -2,6 +2,7 @@ Redis Session Store authors
 ===========================
 
 - Ben Marini
+- Bill Ruddock
 - Dan Buch
 - Donald Plummer
 - Edwin Cruz
@@ -23,3 +24,5 @@ Redis Session Store authors
 - Anton Kolodii
 - Peter Karman
 - Zach Margolis
+- Zachary Belzer
+- Yutaka Kamei

@@ -1,18 +1,17 @@
 require 'json'
 
 describe RedisSessionStore do
+  subject(:store) { described_class.new(nil, options) }
+
   let :random_string do
     "#{rand}#{rand}#{rand}"
+  end
+  let :default_options do
+    store.instance_variable_get(:@default_options)
   end
 
   let :options do
     {}
-  end
-
-  subject(:store) { RedisSessionStore.new(nil, options) }
-
-  let :default_options do
-    store.instance_variable_get(:@default_options)
   end
 
   it 'assigns a :namespace to @default_options' do
@@ -35,7 +34,7 @@ describe RedisSessionStore do
     end
 
     it 'creates a redis instance' do
-      expect(store.instance_variable_get(:@redis)).to_not be_nil
+      expect(store.instance_variable_get(:@redis)).not_to be_nil
     end
 
     it 'assigns the :host option to @default_options' do
@@ -96,7 +95,7 @@ describe RedisSessionStore do
     end
 
     it 'creates a redis instance' do
-      expect(store.instance_variable_get(:@redis)).to_not be_nil
+      expect(store.instance_variable_get(:@redis)).not_to be_nil
     end
 
     it 'assigns the :host option to @default_options' do
@@ -158,7 +157,7 @@ describe RedisSessionStore do
     # https://github.com/rack/rack/blob/1.4.5/lib/rack/session/abstract/id.rb
 
     let(:env)          { double('env') }
-    let(:session_id)   { 12_345 }
+    let(:session_id)   { Rack::Session::SessionId.new('12 345') }
     let(:session_data) { double('session_data') }
     let(:options)      { { expire_after: 123 } }
 
@@ -218,7 +217,8 @@ describe RedisSessionStore do
   end
 
   describe 'checking for session existence' do
-    let(:session_id) { 'foo' }
+    let(:public_id) { 'foo' }
+    let(:session_id) { Rack::Session::SessionId.new(public_id) }
 
     before do
       allow(store).to receive(:current_session_id)
@@ -228,15 +228,16 @@ describe RedisSessionStore do
     context 'when session id is not provided' do
       context 'when session id is nil' do
         let(:session_id) { nil }
+
         it 'returns false' do
           expect(store.send(:session_exists?, :env)).to eq(false)
         end
       end
 
       context 'when session id is empty string' do
-        let(:session_id) { '' }
+        let(:public_id) { '' }
+
         it 'returns false' do
-          allow(store).to receive(:current_session_id).with(:env).and_return('')
           expect(store.send(:session_exists?, :env)).to eq(false)
         end
       end
@@ -249,17 +250,43 @@ describe RedisSessionStore do
         end
       end
 
-      context 'when session id does not exist in redis' do
-        it 'returns false' do
-          expect(redis).to receive(:exists).with('foo').and_return(false)
-          expect(store.send(:session_exists?, :env)).to eq(false)
+      context 'when session private id does not exist in redis' do
+        context 'when session public id does not exist in redis' do
+          it 'returns false' do
+            expect(redis).to receive(:exists)
+              .with(session_id.private_id)
+              .and_return(false)
+            expect(redis).to receive(:exists).with('foo').and_return(false)
+            expect(store.send(:session_exists?, :env)).to eq(false)
+          end
+        end
+
+        context 'when session public id exists in redis' do
+          it 'returns true' do
+            expect(redis).to receive(:exists)
+              .with(session_id.private_id)
+              .and_return(false)
+            expect(redis).to receive(:exists).with('foo').and_return(true)
+            expect(store.send(:session_exists?, :env)).to eq(true)
+          end
         end
       end
 
-      context 'when session id exists in redis' do
+      context 'when session private id exists in redis' do
         it 'returns true' do
-          expect(redis).to receive(:exists).with('foo').and_return(true)
+          expect(redis).to receive(:exists)
+            .with(session_id.private_id)
+            .and_return(true)
           expect(store.send(:session_exists?, :env)).to eq(true)
+        end
+      end
+
+      context 'when session public id is formatted like a private id' do
+        let(:public_id) { Rack::Session::SessionId.new('foo').private_id }
+
+        it 'returns false' do
+          expect(redis).not_to receive(:exists)
+          expect(store.send(:session_exists?, :env)).to eq(false)
         end
       end
 
@@ -280,14 +307,59 @@ describe RedisSessionStore do
     end
 
     let(:fake_key) { 'thisisarediskey' }
+    let(:session_id) { Rack::Session::SessionId.new(fake_key) }
 
-    it 'retrieves the prefixed key from redis' do
-      redis = double('redis')
-      allow(store).to receive(:redis).and_return(redis)
-      allow(store).to receive(:generate_sid).and_return(fake_key)
-      expect(redis).to receive(:get).with("#{options[:key_prefix]}#{fake_key}")
+    describe 'generate_sid' do
+      it 'generates a secure ID' do
+        sid = store.send(:generate_sid)
+        expect(sid).to be_a(Rack::Session::SessionId)
+      end
+    end
 
-      store.send(:get_session, double('env'), fake_key)
+    context 'when redis is up' do
+      let(:redis) { double('redis') }
+      let(:private_exists) { true }
+
+      before do
+        allow(store).to receive(:redis).and_return(redis)
+        allow(redis).to receive(:exists)
+          .with("#{options[:key_prefix]}#{session_id.private_id}")
+          .and_return(private_exists)
+      end
+
+      context 'when session private id exists in redis' do
+        it 'retrieves the prefixed private id from redis' do
+          expect(redis).to receive(:get).with("#{options[:key_prefix]}#{session_id.private_id}")
+
+          store.send(:get_session, double('env'), session_id)
+        end
+      end
+
+      context 'when session private id not found in redis' do
+        let(:private_exists) { false }
+
+        it 'retrieves the prefixed public id from redis' do
+          expect(redis).to receive(:get).with("#{options[:key_prefix]}#{fake_key}")
+
+          store.send(:get_session, double('env'), session_id)
+        end
+      end
+
+      context 'when session id is formatted like a private id' do
+        let(:fake_key) { Rack::Session::SessionId.new('anykey').private_id }
+        let(:new_sid) { Rack::Session::SessionId.new('newid') }
+
+        before do
+          allow(store).to receive(:generate_sid).and_return(new_sid)
+        end
+
+        it 'returns a default new session' do
+          expect(redis).not_to receive(:exists)
+          expect(redis).not_to receive(:get)
+          expect(store.send(:get_session, double('env'), session_id))
+            .to eq([new_sid, {}])
+        end
+      end
     end
 
     context 'when redis is down' do
@@ -297,12 +369,12 @@ describe RedisSessionStore do
       end
 
       it 'returns an empty session hash' do
-        expect(store.send(:get_session, double('env'), fake_key).last)
+        expect(store.send(:get_session, double('env'), session_id).last)
           .to eq({})
       end
 
       it 'returns a newly generated sid' do
-        expect(store.send(:get_session, double('env'), fake_key).first)
+        expect(store.send(:get_session, double('env'), session_id).first)
           .to eq('foop')
       end
 
@@ -311,7 +383,7 @@ describe RedisSessionStore do
 
         it 'explodes' do
           expect do
-            store.send(:get_session, double('env'), fake_key)
+            store.send(:get_session, double('env'), session_id)
           end.to raise_error(Redis::CannotConnectError)
         end
       end
@@ -323,6 +395,7 @@ describe RedisSessionStore do
       let(:env) { { 'rack.request.cookie_hash' => cookie_hash } }
       let(:cookie_hash) { double('cookie hash') }
       let(:fake_key) { 'thisisarediskey' }
+      let(:session_id) { Rack::Session::SessionId.new(fake_key) }
 
       before do
         allow(cookie_hash).to receive(:[]).and_return(fake_key)
@@ -333,6 +406,8 @@ describe RedisSessionStore do
         allow(store).to receive(:redis).and_return(redis)
         expect(redis).to receive(:del)
           .with("#{options[:key_prefix]}#{fake_key}")
+        expect(redis).to receive(:del)
+          .with("#{options[:key_prefix]}#{session_id.private_id}")
 
         store.send(:destroy, env)
       end
@@ -363,7 +438,8 @@ describe RedisSessionStore do
         redis = double('redis', setnx: true)
         allow(store).to receive(:redis).and_return(redis)
         sid = store.send(:generate_sid)
-        expect(redis).to receive(:del).with("#{options[:key_prefix]}#{sid}")
+        expect(redis).to receive(:del).with("#{options[:key_prefix]}#{sid.public_id}")
+        expect(redis).to receive(:del).with("#{options[:key_prefix]}#{sid.private_id}")
 
         store.send(:destroy_session, {}, sid, nil)
       end
@@ -372,7 +448,7 @@ describe RedisSessionStore do
 
   describe 'session encoding' do
     let(:env)          { double('env') }
-    let(:session_id)   { 12_345 }
+    let(:session_id)   { Rack::Session::SessionId.new('12 345') }
     let(:session_data) { { 'some' => 'data' } }
     let(:options)      { {} }
     let(:encoded_data) { Marshal.dump(session_data) }
@@ -385,11 +461,12 @@ describe RedisSessionStore do
 
     shared_examples_for 'serializer' do
       it 'encodes correctly' do
-        expect(redis).to receive(:set).with('12345', expected_encoding)
+        expect(redis).to receive(:set).with(session_id.private_id, expected_encoding)
         store.send(:set_session, env, session_id, session_data, options)
       end
 
       it 'decodes correctly' do
+        allow(redis).to receive(:exists).with(session_id.private_id).and_return(true)
         expect(store.send(:get_session, env, session_id))
           .to eq([session_id, session_data])
       end
@@ -397,14 +474,15 @@ describe RedisSessionStore do
 
     context 'marshal' do
       let(:options) { { serializer: :marshal } }
-      it_should_behave_like 'serializer'
+
+      it_behaves_like 'serializer'
     end
 
     context 'json' do
       let(:options) { { serializer: :json } }
       let(:encoded_data) { '{"some":"data"}' }
 
-      it_should_behave_like 'serializer'
+      it_behaves_like 'serializer'
     end
 
     context 'hybrid' do
@@ -412,13 +490,13 @@ describe RedisSessionStore do
       let(:expected_encoding) { '{"some":"data"}' }
 
       context 'marshal encoded data' do
-        it_should_behave_like 'serializer'
+        it_behaves_like 'serializer'
       end
 
       context 'json encoded data' do
         let(:encoded_data) { '{"some":"data"}' }
 
-        it_should_behave_like 'serializer'
+        it_behaves_like 'serializer'
       end
     end
 
@@ -438,7 +516,7 @@ describe RedisSessionStore do
       let(:options) { { serializer: custom_serializer } }
       let(:expected_encoding) { 'somedata' }
 
-      it_should_behave_like 'serializer'
+      it_behaves_like 'serializer'
     end
   end
 
@@ -514,7 +592,7 @@ describe RedisSessionStore do
     %w(on_redis_down on_session_load_error).each do |h|
       context 'when nil' do
         it 'does not explode at init' do
-          expect { store }.to_not raise_error
+          expect { store }.not_to raise_error
         end
       end
 
@@ -522,7 +600,7 @@ describe RedisSessionStore do
         let(:options) { { "#{h}": ->(*) { true } } }
 
         it 'does not explode at init' do
-          expect { store }.to_not raise_error
+          expect { store }.not_to raise_error
         end
       end
 
@@ -539,7 +617,7 @@ describe RedisSessionStore do
   describe 'setting the session' do
     it 'allows changing the session' do
       env = { 'rack.session.options' => {} }
-      sid = 1234
+      sid = Rack::Session::SessionId.new('1234')
       allow(store).to receive(:redis).and_return(Redis.new)
       data1 = { 'foo' => 'bar' }
       store.send(:set_session, env, sid, data1)
@@ -551,7 +629,7 @@ describe RedisSessionStore do
 
     it 'allows changing the session when the session has an expiry' do
       env = { 'rack.session.options' => { expire_after: 60 } }
-      sid = 1234
+      sid = Rack::Session::SessionId.new('1234')
       allow(store).to receive(:redis).and_return(Redis.new)
       data1 = { 'foo' => 'bar' }
       store.send(:set_session, env, sid, data1)
