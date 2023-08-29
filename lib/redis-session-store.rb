@@ -40,10 +40,16 @@ class RedisSessionStore < ActionDispatch::Session::AbstractSecureStore
   def initialize(app, options = {})
     super
 
+    @connection_mutex = Mutex.new
+    @last_reconnect = nil
+
+    redis_options = options[:redis] || {}
+
     @default_options[:namespace] = 'rack:session'
-    @default_options.merge!(options[:redis] || {})
-    init_options = options[:redis]&.reject { |k, _v| %i[expire_after key_prefix].include?(k) } || {}
-    @redis = init_options[:client] || Redis.new(init_options)
+    @default_options.merge!(redis_options)
+    @default_options.merge!(redis: redis_options)
+    initialize_redis_connection
+
     @on_redis_down = options[:on_redis_down]
     @serializer = determine_serializer(options[:serializer])
     @on_session_load_error = options[:on_session_load_error]
@@ -56,6 +62,15 @@ class RedisSessionStore < ActionDispatch::Session::AbstractSecureStore
 
   attr_reader :redis, :key, :default_options, :serializer
 
+  def initialize_redis_connection
+    @connection_mutex.synchronize {
+      if @last_reconnect.nil? || @last_reconnect < Time.now - 1
+        @redis = @default_options[:client] || Redis.new(@default_options[:redis])
+        @last_reconnect = Time.now
+      end
+    }
+  end
+
   # overrides method defined in rack to actually verify session existence
   # Prevents needless new sessions from being created in scenario where
   # user HAS session id, but it already expired, or is invalid for some
@@ -63,10 +78,15 @@ class RedisSessionStore < ActionDispatch::Session::AbstractSecureStore
   def session_exists?(env)
     value = current_session_id(env)
 
-    !!(
-      value && !value.empty? &&
-      key_exists_with_fallback?(value)
-    )
+    if value && !value.empty?
+      response = nil
+      retry_and_reconnect_if_not_master do
+        response = key_exists_with_fallback?(value)
+      end
+      response
+    else
+      false
+    end
   rescue Errno::ECONNREFUSED, Redis::CannotConnectError => e
     on_redis_down.call(e, env, value) if on_redis_down
 
@@ -109,6 +129,18 @@ class RedisSessionStore < ActionDispatch::Session::AbstractSecureStore
     [generate_sid, USE_INDIFFERENT_ACCESS ? {}.with_indifferent_access : {}]
   end
 
+  def retry_and_reconnect_if_not_master
+    begin
+      yield
+    rescue Redis::CommandError => e
+      initialize_redis_connection
+      yield
+    rescue Errno::ECONNREFUSED, Redis::CannotConnectError => e
+      initialize_redis_connection
+      yield
+    end
+  end
+
   def get_session(env, sid)
     sid && (session = load_session_with_fallback(sid)) ? [sid, session] : session_default_values
   rescue Errno::ECONNREFUSED, Redis::CannotConnectError => e
@@ -126,7 +158,10 @@ class RedisSessionStore < ActionDispatch::Session::AbstractSecureStore
   end
 
   def load_session_from_redis(sid)
-    data = redis.get(prefixed(sid))
+    data = nil
+    retry_and_reconnect_if_not_master do
+      data = redis.get(prefixed(sid))
+    end
     begin
       data ? decode(data) : nil
     rescue StandardError => e
@@ -143,11 +178,15 @@ class RedisSessionStore < ActionDispatch::Session::AbstractSecureStore
 
   def set_session(env, sid, session_data, options = nil)
     expiry = get_expiry(env, options)
-    if expiry
-      redis.setex(prefixed(sid.private_id), expiry, encode(session_data))
-    else
-      redis.set(prefixed(sid.private_id), encode(session_data))
+
+    retry_and_reconnect_if_not_master do
+      if expiry
+        redis.setex(prefixed(sid.private_id), expiry, encode(session_data))
+      else
+        redis.set(prefixed(sid.private_id), encode(session_data))
+      end
     end
+
     sid
   rescue Errno::ECONNREFUSED, Redis::CannotConnectError => e
     on_redis_down.call(e, env, sid) if on_redis_down
